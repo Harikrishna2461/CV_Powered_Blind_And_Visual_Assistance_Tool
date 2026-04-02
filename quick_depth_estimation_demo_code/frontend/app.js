@@ -680,7 +680,7 @@ class NavigationApp {
         .then(data => {
             if (data.success) {
                 this.displayResults(data);
-                this.generateInstruction(data.target, data.steps, data.angle);
+                this.generateInstruction(data.target, data.steps, data.angle, data.surfaces);
             } else {
                 this.showError(data.error);
             }
@@ -688,14 +688,15 @@ class NavigationApp {
         .catch(err => this.showError(err.message));
     }
     
-    generateInstruction(target, steps, angle) {
+    generateInstruction(target, steps, angle, surfaces) {
         fetch(`${API_BASE_URL}/generate-instruction`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 target: target,
                 steps: steps,
-                angle: angle
+                angle: angle,
+                surfaces: surfaces
             })
         })
         .then(res => res.json())

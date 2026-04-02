@@ -111,7 +111,8 @@ def process():
             result['angle'],
             result['distance_meters'],
             result.get('confidence', 0.85),
-            result.get('depth', 0)
+            result.get('depth', 0),
+            result.get('surfaces', None)  # Pass surface context to instruction generator
         )
         
         result['navigation_guidance'] = {

@@ -101,13 +101,15 @@ def process():
         result['processing_time'] = elapsed
         
         # Add comprehensive instruction data to the response
+        # Pass surfaces for enhanced voice guidance (e.g., "on top of books on a table")
         instruction_result = pipeline.generate_instruction(
             result['target'],
             result['steps'],
             result['angle'],
             result['distance_meters'],
             result.get('confidence', 0.85),
-            result.get('depth', 0)
+            result.get('depth', 0),
+            surfaces=result.get('surfaces', [])
         )
         
         result['navigation_guidance'] = {

@@ -18,6 +18,7 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import base64
 import time
+import numpy as np
 from pathlib import Path
 
 # Add backend folder to path for imports
@@ -161,7 +162,8 @@ def process():
                 result['angle'],
                 result['distance_meters'],
                 result.get('confidence', 0.85),
-                result.get('depth', 0)
+                result.get('depth', 0),
+                result.get('surfaces', None)  # Pass spatial relationship data
             )
             
             result['navigation_guidance'] = {
@@ -173,9 +175,12 @@ def process():
             if "CUDA" in str(e) or "cuda" in str(e):
                 print(f"[API ERROR] CUDA error in generate_instruction: {e}")
                 # Still return the result but without guidance
+                surfaces = result.get('surfaces', [])
+                surface_info = f" on {surfaces[0]['surface']}" if surfaces else ""
+                
                 result['navigation_guidance'] = {
-                    'detailed_text': f'Navigation to {result["target"]}',
-                    'conversational_text': f'Target found at {result["distance_meters"]:.1f} meters',
+                    'detailed_text': f'Navigation to {result["target"]}{surface_info}',
+                    'conversational_text': f'Target found at {result["distance_meters"]:.1f} meters{surface_info}',
                     'summary': {
                         'target': result['target'],
                         'distance_m': round(result['distance_meters'], 2),
@@ -184,7 +189,8 @@ def process():
                         'direction': 'ahead',
                         'angle_degrees': round(result['angle'], 1),
                         'confidence_percent': round(result.get('confidence', 0.85) * 100, 1),
-                        'depth_m': round(result.get('depth', 0), 3)
+                        'depth_m': round(result.get('depth', 0), 3),
+                        'on_surface': surfaces[0]['surface'] if surfaces else None
                     }
                 }
             else:
@@ -257,18 +263,23 @@ def generate_instruction():
         distance_meters = data.get('distance_meters', steps * 0.75)
         confidence = data.get('confidence', 0.85)
         depth = data.get('depth', 0)
+        surfaces = data.get('surfaces', None)  # Extract surfaces from request
         
         # Generate comprehensive instruction
         instruction_result = pipeline.generate_instruction(
-            target, steps, angle, distance_meters, confidence, depth
+            target, steps, angle, distance_meters, confidence, depth, surfaces
         )
         
-        # Generate audio from conversational version
-        audio_path = pipeline.text_to_speech(instruction_result['conversational'])
-        
-        # Convert audio to base64
-        with open(audio_path, 'rb') as f:
-            audio_base64 = base64.b64encode(f.read()).decode()
+        # Try to generate audio, but don't block if TTS is slow
+        audio_base64 = None
+        try:
+            audio_path = pipeline.text_to_speech(instruction_result['conversational'])
+            # Convert audio to base64
+            with open(audio_path, 'rb') as f:
+                audio_base64 = base64.b64encode(f.read()).decode()
+        except Exception as tts_error:
+            print(f"[TTS] Warning - audio generation failed: {tts_error}")
+            # Continue without audio
         
         return jsonify({
             'success': True,
@@ -276,7 +287,103 @@ def generate_instruction():
             'conversational_text': instruction_result['conversational'],
             'summary': instruction_result['summary'],
             'audio_base64': audio_base64,
-            'audio_format': 'wav'
+            'audio_format': 'wav' if audio_base64 else None
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==================== FEW-SHOT LEARNING ENDPOINTS ====================
+@app.route('/api/few-shot/add-reference', methods=['POST'])
+def add_few_shot_reference():
+    """Add a reference image for few-shot object learning"""
+    try:
+        if 'image' not in request.files or 'object_name' not in request.form:
+            return jsonify({'error': 'Missing image or object_name'}), 400
+        
+        file = request.files['image']
+        object_name = request.form['object_name'].strip()
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type. Allowed: ' + ', '.join(ALLOWED_EXTENSIONS)}), 400
+        
+        if not object_name:
+            return jsonify({'error': 'Object name cannot be empty'}), 400
+        
+        # Save temporarily
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"ref_{object_name}_{filename}")
+        file.save(filepath)
+        
+        try:
+            # Load image
+            from PIL import Image
+            image = Image.open(filepath)
+            image_array = np.array(image).astype(np.uint8)
+            
+            # Add to few-shot matcher
+            pipeline.few_shot_matcher.add_reference(object_name, image_array)
+            
+            return jsonify({
+                'success': True,
+                'object_name': object_name,
+                'message': f'Reference added for {object_name}'
+            }), 200
+        finally:
+            # Clean up temp file
+            if os.path.exists(filepath):
+                os.remove(filepath)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/few-shot/database-info', methods=['GET'])
+def get_few_shot_database_info():
+    """Get information about stored few-shot references"""
+    try:
+        if not pipeline.few_shot_matcher:
+            return jsonify({
+                'success': True,
+                'database': {},
+                'total_objects': 0,
+                'message': 'FewShotMatcher not initialized'
+            }), 200
+        
+        db_info = pipeline.few_shot_matcher.get_database_info()
+        
+        return jsonify({
+            'success': True,
+            'database': db_info,
+            'total_objects': len(db_info),
+            'objects': list(db_info.keys())
+        }), 200
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/few-shot/clear-references', methods=['POST'])
+def clear_few_shot_references():
+    """Clear stored few-shot references"""
+    try:
+        data = request.get_json() or {}
+        object_name = data.get('object_name', None)
+        
+        if not pipeline.few_shot_matcher:
+            return jsonify({'error': 'FewShotMatcher not initialized'}), 400
+        
+        pipeline.few_shot_matcher.clear_references(object_name)
+        
+        if object_name:
+            message = f'Cleared references for {object_name}'
+        else:
+            message = 'Cleared all references'
+        
+        return jsonify({
+            'success': True,
+            'message': message
         }), 200
     
     except Exception as e:
@@ -313,4 +420,5 @@ if __name__ == '__main__':
     print("Open your browser to: http://localhost:5001")
     print("\nPress Ctrl+C to stop the server")
     print("="*60 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    # Disable debug mode to avoid auto-reloader issues and hanging requests
+    app.run(debug=False, use_reloader=False, host='0.0.0.0', port=5001, threaded=True)
