@@ -19,6 +19,7 @@ import base64
 from pathlib import Path
 import signal
 import sys
+from depth_anything_3.api import DepthAnything3
 
 # Disable CUDA in torch explicitly after import
 try:
@@ -508,36 +509,44 @@ class NavigationPipeline:
             else:
                 print(f"[✗] GroundingDINO failed: {e}")
                 self.grounding_model = None
-        
-        print("Loading Depth Anything V2...")
+        print("Loading Depth Anything V3...")
         try:
-            def load_depth():
-                processor = AutoImageProcessor.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                model = AutoModelForDepthEstimation.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                return processor, model
-            
-            self.depth_processor, self.depth_model = load_with_timeout(
-                load_depth, timeout_secs=60, model_name="Depth Anything V2"
-            ) or (None, None)
-            
-            if self.depth_model is not None:
-                self.depth_model.eval()
-                try:
-                    self.depth_model = self.depth_model.to('cpu')
-                except:
-                    pass
-                print("[✓] Depth Anything V2 loaded on CPU")
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            model = DepthAnything3.from_pretrained("depth-anything/da3metric-large")
+            model = model.to(device)
+            self.depth_model_v3 = model
+            print("[✓] Depth Anything V3 loaded on {}".format(device))
         except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] Depth V2 CUDA error: {e}")
-            else:
-                print(f"[✗] Depth V2 failed: {e}")
-            self.depth_model = None
-            self.depth_processor = None
+            print(f"[✗] Depth Anything V3 failed: {e}")
+        # print("Loading Depth Anything V2...")
+        # try:
+        #     def load_depth():
+        #         processor = AutoImageProcessor.from_pretrained(
+        #             "depth-anything/Depth-Anything-V2-base-hf"
+        #         )
+        #         model = AutoModelForDepthEstimation.from_pretrained(
+        #             "depth-anything/Depth-Anything-V2-base-hf"
+        #         )
+        #         return processor, model
+        #
+        #     self.depth_processor, self.depth_model = load_with_timeout(
+        #         load_depth, timeout_secs=60, model_name="Depth Anything V2"
+        #     ) or (None, None)
+        #
+        #     if self.depth_model is not None:
+        #         self.depth_model.eval()
+        #         try:
+        #             self.depth_model = self.depth_model.to('cpu')
+        #         except:
+        #             pass
+        #         print("[✓] Depth Anything V2 loaded on CPU")
+        # except Exception as e:
+        #     if "CUDA" in str(e) or "cuda" in str(e):
+        #         print(f"[✗] Depth V2 CUDA error: {e}")
+        #     else:
+        #         print(f"[✗] Depth V2 failed: {e}")
+        #     self.depth_model = None
+        #     self.depth_processor = None
         print("Loading Whisper...")
         try:
             def load_whisper():
@@ -609,7 +618,7 @@ class NavigationPipeline:
 ║           Models Initialization Complete                    ║
 ║                                                              ║
 ║  GroundingDINO: {'✓ loaded' if self.grounding_model else '✗ failed'}                        
-║  Depth Anything V2: {'✓ loaded' if self.depth_model else '✗ failed'}                   
+║  Depth Anything V3: {'✓ loaded' if self.depth_model_v3 else '✗ failed'}                   
 ║  Whisper: {'✓ loaded' if self.whisper_model else '✗ failed'}                          
 ║  Flan-T5: {'✓ loaded' if self.instr_model else '✗ failed'}                              
 ║  TTS: {'✓ loaded' if self.tts else '✗ failed'}                                
@@ -928,7 +937,15 @@ class NavigationPipeline:
             print(f"[SURFACE] Returning top {len(top_surfaces)} surface(s) for '{target}'")
         
         return top_surfaces
-    
+
+    def get_step_count(self, distance):
+        # Average: 0.75m for normal walking
+        average_step_length = 0.75
+        steps = distance / average_step_length
+        # Ensure minimum meaningful step count
+        steps = max(steps, 1)
+        return steps
+
     def improved_depth_to_steps(self, depth_meters, image_width, object_width_pixels):
         """
         Improved depth-to-steps conversion using calibration and object size
@@ -1090,7 +1107,63 @@ class NavigationPipeline:
             # Fall back to DINO scores
         
         return enhanced_logits
-    
+
+    def compute_object_depth(self, image_source, img_np, x1, y1, x2, y2):
+        """
+        Computes median depth (in meters) for a bounding box region.
+
+        Args:
+            image_source: Input image for the model
+            img_np: Original image as numpy array (H, W, C)
+            x1, y1, x2, y2: Bounding box coordinates (in original image scale)
+
+        Returns:
+            obj_depth_meters (float)
+        """
+
+        # Run depth inference
+        depth_prediction = self.depth_model_v3.inference([image_source])
+        depth = depth_prediction.depth  # shape: (1, H, W)
+
+        # Depth map size
+        _, dh, dw = depth.shape
+        ih, iw = img_np.shape[:2]
+
+        # Scaling factors
+        scale_y = dh / ih
+        scale_x = dw / iw
+
+        # Scale bbox to depth map coordinates
+        y1_d = int(y1 * scale_y)
+        y2_d = int(y2 * scale_y)
+        x1_d = int(x1 * scale_x)
+        x2_d = int(x2 * scale_x)
+
+        # Clamp to valid bounds
+        y1_d = max(0, min(dh, y1_d))
+        y2_d = max(0, min(dh, y2_d))
+        x1_d = max(0, min(dw, x1_d))
+        x2_d = max(0, min(dw, x2_d))
+
+        # Ensure valid box (avoid inverted coords)
+        if y2_d <= y1_d or x2_d <= x1_d:
+            return 0.0
+
+        # Extract patch
+        patch = depth[0, y1_d:y2_d, x1_d:x2_d]
+
+        # Handle empty / invalid patches
+        if patch.size == 0:
+            return 0.0
+
+        # Optional: ignore NaNs / infs if model outputs them
+        patch = patch[np.isfinite(patch)]
+        if patch.size == 0:
+            return 0.0
+
+        # Compute median depth
+        return float(np.median(patch))
+
     def process_image(self, image_path, target):
         """
         Process image and estimate navigation parameters
@@ -1164,38 +1237,13 @@ class NavigationPipeline:
             y1 = max(0, y1)
             x2 = min(w, x2)
             y2 = min(h, y2)
-            
-            object_width = x2 - x1
-            
-            # Estimate depth
-            with torch.no_grad():
-                try:
-                    inputs = self.depth_processor(images=image_source, return_tensors="pt")
-                    # Ensure inputs are on GPU if available
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-                    outputs = self.depth_model(**inputs)
-                    depth = outputs.predicted_depth.to('cpu')
-                except Exception as depth_error:
-                    print(f"[ERROR] Depth estimation failed: {depth_error}")
-                    return {
-                        'success': False,
-                        'error': f'Depth estimation error: {str(depth_error)}'
-                    }
-            
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(1),
-                size=(h, w),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-            
-            depth_map = depth.detach().cpu().numpy()
-            obj_depth = depth_map[y1:y2, x1:x2].mean()
-            
-            # Use improved depth-to-steps conversion
-            steps, meters = self.improved_depth_to_steps(obj_depth, w, object_width)
-            
+
+            # Compute object depth in meters using the depth model
+            obj_depth_meters = self.compute_object_depth(image_source, img_np, x1, y1, x2, y2)
+
+            # Get step counts to the target from the capture device
+            steps = self.get_step_count(obj_depth_meters)
+
             # Calculate angle (raw, no thresholds)
             img_center = w / 2
             obj_center = (x1 + x2) / 2
@@ -1290,7 +1338,7 @@ class NavigationPipeline:
             # LEFT COLUMN: DISTANCE
             col_spacing = w // 2
             cv2.putText(vis, "DISTANCE:", (20, section3_y + 30), font, 0.65, (180, 180, 150), 2)
-            distance_text = f"{meters:.1f}m"
+            distance_text = f"{obj_depth_meters:.1f}m"
             distance_w = cv2.getTextSize(distance_text, font, 1.3, 2)[0][0]
             cv2.putText(vis, distance_text, (20 + (col_spacing - 20 - distance_w) // 2, section3_y + 70), font, 1.3, (100, 255, 255), 2)
             
@@ -1325,8 +1373,8 @@ class NavigationPipeline:
                 'target': target,
                 'angle': float(angle),
                 'steps': float(steps),
-                'distance_meters': float(meters),
-                'depth': float(obj_depth),
+                'distance_meters': float(obj_depth_meters),
+                'depth': float(obj_depth_meters),
                 'bbox': [x1, y1, x2, y2],
                 'visualization': img_base64,
                 'confidence': float(logits[0].item() if logits is not None else 0),

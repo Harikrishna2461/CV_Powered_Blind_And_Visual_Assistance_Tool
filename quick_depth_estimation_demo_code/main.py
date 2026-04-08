@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'backend'))
 # Ensure we're in the correct working directory
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from pipeline import NavigationPipeline
+from backend.pipeline import NavigationPipeline
 
 app = Flask(__name__, static_folder='frontend', static_url_path='')
 CORS(app)
