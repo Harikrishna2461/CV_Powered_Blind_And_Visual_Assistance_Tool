@@ -65,7 +65,21 @@ The CV-Powered Vision Assistance System comprises three primary layers:
     \item \textbf{Output Generation Layer}: Produces natural language instructions with audio playback and visual feedback
 \end{enumerate}
 
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/01_system_architecture.png}
+    \caption{System Architecture Overview: The CV-Powered Vision Assistance System integrates five major deep learning models within a Flask REST API backend, supporting both CPU and GPU acceleration. The system processes inputs through a unified pipeline while maintaining device abstraction for hardware compatibility.}
+    \label{fig:architecture}
+\end{figure}
+
 \subsection{Detection Pipeline}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/02_pipeline_flow.png}
+    \caption{Image Processing Pipeline Flow: The system processes images through sequential detection and depth estimation stages, with parallel branches for surface detection, few-shot matching, and speech recognition. Results are aggregated and converted to natural language instructions through template-based generation.}
+    \label{fig:pipeline_flow}
+\end{figure}
 
 \subsubsection{Enhanced Caption Generation}
 
@@ -268,6 +282,13 @@ Measured in milliseconds for complete processing pipeline from image input to in
 
 GPU acceleration provides approximately 3.9× speedup compared to CPU-only inference.
 
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/03_performance_analysis.png}
+    \caption{Comprehensive Performance Analysis: (Top-Left) Component-wise processing times showing GPU speedup across all stages. (Top-Right) Total pipeline execution time with 3.9× GPU speedup. (Bottom-Left) Ablation study demonstrating that GPU acceleration provides consistent speedup regardless of enabled features. (Bottom-Right) Depth estimation method comparison, justifying MiDaS selection for optimal speed-accuracy tradeoff.}
+    \label{fig:performance_analysis}
+\end{figure}
+
 \subsubsection{Qualitative Results}
 
 \begin{enumerate}
@@ -277,6 +298,13 @@ GPU acceleration provides approximately 3.9× speedup compared to CPU-only infer
     \item \textbf{Audio Playback}: macOS voice synthesis provides clear, natural-sounding instructions
     \item \textbf{Multi-Modal Interface}: Both blind and visually-impaired modes serve distinct user populations effectively
 \end{enumerate}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/04_confidence_distribution.png}
+    \caption{Object Detection Confidence Distribution for Small Gadgets: Histogram comparing GroundingDINO-only detection with hybrid DINO+Siamese approach. The Siamese network verification boosts confidence scores for small objects (phones, speakers, watches) by incorporating few-shot reference matching. Mean confidence increases from 0.52 to 0.63 with hybrid approach.}
+    \label{fig:confidence_dist}
+\end{figure}
 
 \subsection{Ablation Study}
 
@@ -324,6 +352,20 @@ Results demonstrate:
 \end{table}
 
 MiDaS\_small was selected for balancing speed and accuracy, with calibrated conversion from normalized depth values to estimated distances.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/05_surface_detection.png}
+    \caption{Surface Detection Analysis: (Left) Detection accuracy for different surface types, with high-specificity surfaces (table, desk, chair) achieving 85-92\% accuracy while generic surfaces (floor, ground) achieve 72-78\%. (Right) Contribution of validation criteria to surface detection confidence, showing balanced importance across vertical alignment, horizontal alignment, size constraint, and depth verification.}
+    \label{fig:surface_detection}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{report_figures/06_inference_comparison.png}
+    \caption{Inference Speed Comparison Across Configurations: CPU and GPU execution times for full pipeline and various component combinations. GPU acceleration provides consistent 3.9-4.1× speedup regardless of enabled features. The full system (detection + depth + surfaces + instruction generation) runs in 910ms on GPU, enabling real-time interactive deployment.}
+    \label{fig:inference_comp}
+\end{figure}
 
 \subsection{Discussions and Limitations}
 
