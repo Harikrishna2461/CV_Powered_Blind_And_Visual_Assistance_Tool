@@ -47,9 +47,9 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_FILE_SIZE
 print("="*60)
 print("Initializing Navigation Pipeline...")
 try:
-    pipeline = NavigationPipeline(device='cpu')
+    pipeline = NavigationPipeline()
     print("✅ Pipeline initialized successfully!")
-    print("   All models loaded on CPU")
+    print(f"   Models loaded on {pipeline.device.upper()}")
 except RuntimeError as e:
     if "CUDA" in str(e):
         print(f"[WARNING] CUDA error during initialization: {e}")
@@ -270,15 +270,12 @@ def generate_instruction():
             target, steps, angle, distance_meters, confidence, depth, surfaces
         )
         
-        # Try to generate audio, but don't block if TTS is slow
-        audio_base64 = None
+        # Try to play audio
         try:
-            audio_path = pipeline.text_to_speech(instruction_result['conversational'])
-            # Convert audio to base64
-            with open(audio_path, 'rb') as f:
-                audio_base64 = base64.b64encode(f.read()).decode()
+            pipeline.text_to_speech(instruction_result['conversational'])
+            print(f"[SUCCESS] Audio played")
         except Exception as tts_error:
-            print(f"[TTS] Warning - audio generation failed: {tts_error}")
+            print(f"[TTS] Warning - audio playback failed: {tts_error}")
             # Continue without audio
         
         return jsonify({

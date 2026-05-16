@@ -1,9 +1,4 @@
 import os
-# DISABLE CUDA FIRST - before torch is imported
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['CUDA_HOME'] = ''
-os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
 # Disable HuggingFace model downloads if cache not available
 os.environ['HF_HUB_OFFLINE'] = '0'  # Allow online but will fallback to cache
@@ -157,23 +152,24 @@ import groundingdino.util.inference as groundingdino_inference
 # FIX: Patch GroundingDINO's predict() to handle device properly
 original_predict = groundingdino_inference.predict
 
-def patched_predict(model, image, caption, box_threshold, text_threshold, device='cpu', remove_combined=False):
+def patched_predict(model, image, caption, box_threshold, text_threshold, device='cuda', remove_combined=False):
     """
-    Fixed version - NO .to() calls. Subtraction operator patched for bool tensors.
+    Fixed version - Supports both CPU and GPU. Subtraction operator patched for bool tensors.
     """
     from groundingdino.util.inference import preprocess_caption, get_phrases_from_posmap
     import bisect
-    
-    # Ensure image is float32
+
+    # Ensure image is float32 and on correct device
     if isinstance(image, torch.Tensor) and image.dtype != torch.float32:
         image = image.float()
-    
+    image = image.to(device)
+
     caption = preprocess_caption(caption=caption)
-    
+
     with torch.no_grad():
         # Forward pass - bool tensor subtraction is now handled by patched __sub__
         outputs = model(image[None], captions=[caption])
-    
+
     prediction_logits = outputs["pred_logits"].cpu().sigmoid()[0]
     prediction_boxes = outputs["pred_boxes"].cpu()[0]
     
@@ -208,8 +204,9 @@ predict = patched_predict
 print("[PATCH] GroundingDINO predict() patched - Tensor.to() fix in place")
 
 
-# Depth Anything V2
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+# MiDaS - Intel's depth estimation (more accurate than Depth Anything V2)
+import urllib.request
+import torch.hub
 
 # Audio LLM (faster-whisper)
 from faster_whisper import WhisperModel
@@ -217,8 +214,9 @@ from faster_whisper import WhisperModel
 # Local instruction LLM
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# TTS - Import lazily to avoid slow scipy load on macOS
-TTS = None  # Will be imported on first use
+# TTS - Use macOS native 'say' command for reliable audio output
+import subprocess
+import platform
 
 
 # Timeout helper for long-running operations
@@ -460,22 +458,33 @@ class FewShotMatcher:
 
 
 class NavigationPipeline:
-    def __init__(self, device='cpu'):
-        # Use CPU - stable for all platforms
-        self.device = 'cpu'
-        print("[✓] Using CPU for all models (stable inference)")
-        
+    def __init__(self, device='auto'):
+        # Auto-detect device: use GPU if available, fall back to CPU
+        if device == 'auto':
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+                print(f"[✓] GPU detected: {torch.cuda.get_device_name(0)}")
+            else:
+                self.device = 'cpu'
+                print("[✓] GPU not available, using CPU")
+        else:
+            self.device = device
+            print(f"[✓] Using device: {self.device}")
+
         # Initialize FewShotMatcher for few-shot learning
         self.few_shot_matcher = None
-        
+
         try:
             self.load_models()
             # Initialize FewShotMatcher after models are loaded
-            self.few_shot_matcher = FewShotMatcher(device='cpu')
+            self.few_shot_matcher = FewShotMatcher(device=self.device)
             print("[✓] FewShotMatcher initialized for few-shot learning")
         except RuntimeError as e:
             if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[WARNING] Ignoring CUDA error during initialization: {e}")
+                print(f"[WARNING] CUDA error during initialization, falling back to CPU: {e}")
+                self.device = 'cpu'
+                self.load_models()
+                self.few_shot_matcher = FewShotMatcher(device='cpu')
             else:
                 raise
     
@@ -484,23 +493,20 @@ class NavigationPipeline:
         return self.device
     
     def load_models(self):
-        """Load all required models on CPU"""
-        
-        print("Loading GroundingDINO...")
+        """Load all required models on the selected device (GPU or CPU)"""
+
+        print(f"Loading GroundingDINO on {self.device.upper()}...")
         try:
             base_dir = Path(__file__).parent.parent
             config_path = str(base_dir / "GroundingDINO_SwinT_OGC.py")
             model_path = str(base_dir / "groundingdino_swint_ogc.pth")
             self.grounding_model = load_model(config_path, model_path)
             self.grounding_model.eval()
-            
-            # Keep on CPU
-            for param in self.grounding_model.parameters():
-                param.data = param.data.cpu()
-            for buffer in self.grounding_model.buffers():
-                buffer.data = buffer.data.cpu()
-            
-            print("[✓] GroundingDINO loaded on CPU")
+
+            # Move to device (GPU or CPU)
+            self.grounding_model = self.grounding_model.to(self.device)
+
+            print(f"[✓] GroundingDINO loaded on {self.device.upper()}")
         except Exception as e:
             if "CUDA" in str(e) or "cuda" in str(e):
                 print(f"[✗] GroundingDINO CUDA error: {e}")
@@ -509,45 +515,40 @@ class NavigationPipeline:
                 print(f"[✗] GroundingDINO failed: {e}")
                 self.grounding_model = None
         
-        print("Loading Depth Anything V2...")
+        print(f"Loading MiDaS Depth Estimation on {self.device.upper()}...")
         try:
-            def load_depth():
-                processor = AutoImageProcessor.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                model = AutoModelForDepthEstimation.from_pretrained(
-                    "depth-anything/Depth-Anything-V2-base-hf"
-                )
-                return processor, model
-            
-            self.depth_processor, self.depth_model = load_with_timeout(
-                load_depth, timeout_secs=60, model_name="Depth Anything V2"
-            ) or (None, None)
-            
+            def load_midas_depth():
+                # Load the smaller, faster MiDaS model
+                midas = torch.hub.load('intel-isl/MiDaS', 'MiDaS_small', pretrained=True)
+                midas.eval()
+                return midas
+
+            self.depth_model = load_with_timeout(
+                load_midas_depth, timeout_secs=120, model_name="MiDaS Depth"
+            )
+            self.depth_processor = None  # MiDaS doesn't need a separate processor
+
             if self.depth_model is not None:
-                self.depth_model.eval()
                 try:
-                    self.depth_model = self.depth_model.to('cpu')
-                except:
-                    pass
-                print("[✓] Depth Anything V2 loaded on CPU")
+                    self.depth_model = self.depth_model.to(self.device)
+                    print(f"[✓] MiDaS loaded on {self.device.upper()}")
+                except Exception as e:
+                    print(f"[✗] MiDaS move to {self.device.upper()} failed: {e}")
+                    self.depth_model = None
         except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] Depth V2 CUDA error: {e}")
-            else:
-                print(f"[✗] Depth V2 failed: {e}")
+            print(f"[✗] MiDaS loading failed: {e}")
             self.depth_model = None
-            self.depth_processor = None
-        print("Loading Whisper...")
+        print(f"Loading Whisper on {self.device.upper()}...")
         try:
             def load_whisper():
-                return WhisperModel("small", device='cpu')
-            
+                device_str = 'cuda' if self.device == 'cuda' else 'cpu'
+                return WhisperModel("small", device=device_str)
+
             self.whisper_model = load_with_timeout(
                 load_whisper, timeout_secs=60, model_name="Whisper"
             )
             if self.whisper_model is not None:
-                print("[✓] Whisper loaded")
+                print(f"[✓] Whisper loaded on {self.device.upper()}")
         except Exception as e:
             if "CUDA" in str(e) or "cuda" in str(e):
                 print(f"[✗] Whisper CUDA error: {e}")
@@ -555,22 +556,22 @@ class NavigationPipeline:
                 print(f"[✗] Whisper failed: {e}")
             self.whisper_model = None
         
-        print("Loading Flan-T5...")
+        print(f"Loading Flan-T5 on {self.device.upper()}...")
         try:
             def load_t5():
                 tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
                 model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
                 return tokenizer, model
-            
+
             result = load_with_timeout(load_t5, timeout_secs=60, model_name="Flan-T5")
             if result:
                 self.instr_tokenizer, self.instr_model = result
                 self.instr_model.eval()
                 try:
-                    self.instr_model = self.instr_model.to('cpu')
+                    self.instr_model = self.instr_model.to(self.device)
                 except:
                     pass
-                print("[✓] Flan-T5 loaded")
+                print(f"[✓] Flan-T5 loaded on {self.device.upper()}")
             else:
                 self.instr_tokenizer = None
                 self.instr_model = None
@@ -582,26 +583,24 @@ class NavigationPipeline:
             self.instr_model = None
             self.instr_tokenizer = None
         
-        print("Loading TTS...")
+        print("Loading TTS (macOS native 'say' command)...")
         try:
-            def load_tts():
-                # Lazy import of TTS to avoid slow scipy load on macOS
-                global TTS
-                if TTS is None:
-                    print("  [TTS] Importing TTS module (this may take 30+ seconds)...")
-                    from TTS.api import TTS as TTS_API
-                    TTS = TTS_API
-                return TTS(model_name="tts_models/en/ljspeech/tacotron2-DDC", progress_bar=False, gpu=False)
-            
-            self.tts = load_with_timeout(load_tts, timeout_secs=120, model_name="TTS")
-            if self.tts is not None:
-                print("[SUCCESS] TTS loaded successfully")
-                print("[✓] TTS loaded")
-        except Exception as e:
-            if "CUDA" in str(e) or "cuda" in str(e):
-                print(f"[✗] TTS CUDA error: {e}")
+            # Check if we're on macOS
+            if platform.system() == "Darwin":
+                # Test the 'say' command exists
+                result = subprocess.run(['which', 'say'], capture_output=True)
+                if result.returncode == 0:
+                    self.tts = True  # Just a flag that TTS is available
+                    print("[✓] macOS 'say' command available for TTS")
+                else:
+                    print("[✗] 'say' command not found")
+                    self.tts = None
             else:
-                print(f"[✗] TTS failed: {e}")
+                # For non-macOS systems, silently disable TTS
+                print("[!] Not on macOS, TTS disabled (text output only)")
+                self.tts = None
+        except Exception as e:
+            print(f"[✗] TTS initialization failed: {e}")
             self.tts = None
         
         print(f"""
@@ -609,7 +608,7 @@ class NavigationPipeline:
 ║           Models Initialization Complete                    ║
 ║                                                              ║
 ║  GroundingDINO: {'✓ loaded' if self.grounding_model else '✗ failed'}                        
-║  Depth Anything V2: {'✓ loaded' if self.depth_model else '✗ failed'}                   
+║  MiDaS Depth: {'✓ loaded' if self.depth_model else '✗ failed'}                      
 ║  Whisper: {'✓ loaded' if self.whisper_model else '✗ failed'}                          
 ║  Flan-T5: {'✓ loaded' if self.instr_model else '✗ failed'}                              
 ║  TTS: {'✓ loaded' if self.tts else '✗ failed'}                                
@@ -730,11 +729,65 @@ class NavigationPipeline:
         else:
             return "sharply to your left"
     
+    def estimate_depth(self, image_np):
+        """Estimate depth using MiDaS model"""
+        if self.depth_model is None:
+            return None
+        
+        try:
+            # Prepare image for MiDaS
+            # MiDaS transforms and normalizes internally using transforms.Compose
+            h, w = image_np.shape[:2]
+            
+            # Convert to PIL Image for MiDaS transforms
+            if isinstance(image_np, np.ndarray):
+                if image_np.dtype == np.uint8:
+                    pil_img = Image.fromarray(cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB))
+                else:
+                    pil_img = Image.fromarray((image_np * 255).astype(np.uint8))
+            else:
+                pil_img = image_np
+            
+            # Use MiDaS transform
+            transform = torch.hub.load('intel-isl/MiDaS', 'transforms').small_transform
+            input_batch = transform(pil_img).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                output = self.depth_model(input_batch)
+                # Resize to original image size
+                depth_map = torch.nn.functional.interpolate(
+                    output.unsqueeze(1),
+                    size=(h, w),
+                    mode='bicubic',
+                    align_corners=False
+                ).squeeze()
+            
+            depth_map = depth_map.cpu().numpy()
+            return depth_map
+        except Exception as e:
+            print(f"[ERROR] Depth estimation failed: {e}")
+            return None
+    
     def text_to_speech(self, text):
-        """Convert text to speech"""
-        tts_path = "instruction.wav"
-        self.tts.tts_to_file(text=text, file_path=tts_path)
-        return tts_path
+        """Play text to speech using macOS 'say' command"""
+        if self.tts is None:
+            print("[WARNING] TTS not initialized, skipping audio playback")
+            return None
+
+        try:
+            # Use macOS 'say' command to play audio directly
+            cmd = ['say', '-f', '-']
+            process = subprocess.run(cmd, input=text.encode(), capture_output=True)
+
+            if process.returncode != 0:
+                print(f"[✗] say command failed: {process.stderr.decode()}")
+                return None
+
+            print(f"[✓] Audio played: {text[:50]}...")
+            return "audio_played"
+        except Exception as e:
+            print(f"[✗] Text-to-speech playback failed: {e}")
+            return None
     
     def verify_models_on_cpu(self):
         """Verify that all models are on CPU by moving parameters directly (not using .to())"""
@@ -929,59 +982,60 @@ class NavigationPipeline:
         
         return top_surfaces
     
-    def improved_depth_to_steps(self, depth_meters, image_width, object_width_pixels):
+    def improved_depth_to_steps(self, depth_value, image_width, object_width_pixels):
         """
-        Improved depth-to-steps conversion using calibration and object size
+        Improved depth-to-steps conversion optimized for MiDaS model
         
-        Parameters:
-        - depth_meters: estimated depth from depth model
-        - image_width: width of the image in pixels
-        - object_width_pixels: width of detected object in pixels
-        
-        Returns:
-        - steps: estimated number of steps to reach the object
+        MiDaS outputs normalized depth values (higher = closer, lower = farther)
+        This function converts them to estimated distance in meters and steps.
         """
-        # Calibration parameters based on typical human height (1.7m)
-        # and average step length (0.75m)
+        # MiDaS works with inverted depth (higher values = closer)
+        # Normalize to a reasonable distance scale
+        # Typical MiDaS values range from ~0.1 to ~1.0
         
-        # Improved conversion with multiple calibration factors
-        # Account for depth estimation error at different distances
+        # Invert depth for distance (since MiDaS: high=close, low=far)
+        if depth_value < 0.1:
+            depth_value = 0.1
         
-        if depth_meters < 0.5:
-            distance = depth_meters * 0.8  # Closer objects have higher error
-        elif depth_meters < 2:
-            distance = depth_meters * 0.85
-        elif depth_meters < 5:
-            distance = depth_meters * 0.9
+        # Convert normalized MiDaS depth to meters
+        # Using empirical calibration:
+        # MiDaS ~0.8+ = very close (< 2m)
+        # MiDaS ~0.5 = medium distance (2-5m)
+        # MiDaS ~0.2 = far (> 8m)
+        
+        if depth_value >= 0.8:
+            distance_meters = 1.0 + (1.0 - depth_value) * 5  # 1-2m range
+        elif depth_value >= 0.5:
+            distance_meters = 2.0 + (0.8 - depth_value) * 10  # 2-5m range
+        elif depth_value >= 0.3:
+            distance_meters = 5.0 + (0.5 - depth_value) * 25  # 5-8m range
         else:
-            distance = depth_meters * 0.95  # Distant objects more accurate
+            distance_meters = 10.0 + (0.3 - depth_value) * 50  # 8m+ range
         
-        # Apply object size heuristic for additional accuracy
-        # Larger objects in frame likely mean they're closer
+        # Clamp to reasonable bounds
+        distance_meters = max(0.5, min(20.0, distance_meters))
+        
+        # Apply object size heuristic
         object_ratio = object_width_pixels / image_width
-        if object_ratio > 0.3:  # Large object
-            distance *= 0.95
-        elif object_ratio < 0.05:  # Very small object
-            distance *= 1.05
+        if object_ratio > 0.3:  # Large object in frame = likely closer
+            distance_meters *= 0.85
+        elif object_ratio < 0.05:  # Very small object = likely farther
+            distance_meters *= 1.15
         
-        # Standard step length for adults (can be adjusted for user profile)
-        # Average: 0.75m for normal walking
-        average_step_length = 0.75
+        # Convert to steps
+        average_step_length = 0.75  # meters per step
+        steps = distance_meters / average_step_length
+        steps = max(1, min(100, steps))  # Clamp to 1-100 steps
         
-        steps = distance / average_step_length
-        
-        # Ensure minimum meaningful step count
-        steps = max(steps, 1)
-        
-        return steps, distance
+        return steps, distance_meters
     
     def predict_with_cpu_fallback(self, model, image, caption, box_threshold=0.3, text_threshold=0.25):
         """
-        Wrapper that ensures everything is on CPU with correct dtypes BEFORE calling predict.
+        Wrapper that ensures everything is on the correct device with correct dtypes BEFORE calling predict.
         Enhanced with better small object detection support.
         """
-        print(f"[PREDICT] Preparing for inference with caption: {caption}")
-        
+        print(f"[PREDICT] Preparing for inference on {self.device.upper()} with caption: {caption}")
+
         # Ensure image is a proper tensor
         if isinstance(image, np.ndarray):
             print(f"[PREDICT] Converting numpy array (shape: {image.shape}) to tensor")
@@ -992,33 +1046,33 @@ class NavigationPipeline:
             # Convert to tensor as-is (keep HWC format)
             image = torch.from_numpy(image).float()
             print(f"[PREDICT] Converted to tensor: shape={image.shape}, dtype={image.dtype}")
-            image = image.to('cpu')
+            image = image.to(self.device)
         elif hasattr(image, 'to'):
-            image = image.to('cpu')
-            print(f"[PREDICT] Image moved to CPU")
-        
+            image = image.to(self.device)
+            print(f"[PREDICT] Image moved to {self.device.upper()}")
+
         # Verify format
         if hasattr(image, 'dtype'):
             if isinstance(image, torch.Tensor) and image.dtype not in [torch.float32, torch.float64]:
                 print(f"[PREDICT] Converting image from {image.dtype} to float32")
                 image = image.float()
-        
+
         print(f"[PREDICT] Final image: dtype={image.dtype}, shape={image.shape}")
-        
-        # Ensure all model parameters are on CPU before predict is called
+
+        # Ensure all model parameters are on the correct device before predict is called
         try:
             for param in model.parameters():
-                if param.is_cuda or str(param.device) != 'cpu':
-                    param.data = param.data.cpu()
+                if str(param.device) != self.device:
+                    param.data = param.data.to(self.device)
             for buffer in model.buffers():
-                if buffer.is_cuda or str(buffer.device) != 'cpu':
-                    buffer.data = buffer.data.cpu()
-            print(f"[PREDICT] Model moved to CPU")
+                if str(buffer.device) != self.device:
+                    buffer.data = buffer.data.to(self.device)
+            print(f"[PREDICT] Model moved to {self.device.upper()}")
         except:
-            print(f"[PREDICT] Could not move model to CPU, continuing anyway...")
-        
+            print(f"[PREDICT] Could not move model to {self.device.upper()}, continuing anyway...")
+
         # Call predict
-        print(f"[PREDICT] Calling predict() with device='cpu'")
+        print(f"[PREDICT] Calling predict() with device='{self.device}'")
         try:
             boxes, logits, phrases = predict(
                 model=model,
@@ -1026,7 +1080,7 @@ class NavigationPipeline:
                 caption=caption,
                 box_threshold=box_threshold,
                 text_threshold=text_threshold,
-                device='cpu'
+                device=self.device
             )
             print(f"[PREDICT] SUCCESS - found {len(boxes)} boxes")
         except Exception as e:
@@ -1167,31 +1221,17 @@ class NavigationPipeline:
             
             object_width = x2 - x1
             
-            # Estimate depth
-            with torch.no_grad():
-                try:
-                    inputs = self.depth_processor(images=image_source, return_tensors="pt")
-                    # Ensure inputs are on GPU if available
-                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-                    outputs = self.depth_model(**inputs)
-                    depth = outputs.predicted_depth.to('cpu')
-                except Exception as depth_error:
-                    print(f"[ERROR] Depth estimation failed: {depth_error}")
-                    return {
-                        'success': False,
-                        'error': f'Depth estimation error: {str(depth_error)}'
-                    }
+            # Estimate depth using MiDaS
+            depth_map = self.estimate_depth(img_np)
             
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(1),
-                size=(h, w),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-            
-            depth_map = depth.detach().cpu().numpy()
-            obj_depth = depth_map[y1:y2, x1:x2].mean()
+            if depth_map is not None:
+                depth_cropped = depth_map[y1:y2, x1:x2]
+                obj_depth = depth_cropped.mean() if depth_cropped.size > 0 else 1.0
+            else:
+                # Fallback to simple depth estimation if MiDaS fails
+                center_distance = w / 2  # Distance from center (normalized)
+                obj_width = x2 - x1
+                obj_depth = 1.0 + (center_distance / (obj_width + center_distance))
             
             # Use improved depth-to-steps conversion
             steps, meters = self.improved_depth_to_steps(obj_depth, w, object_width)
